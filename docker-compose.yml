@@ -1,0 +1,77 @@
+
+services:
+  backend:
+    build: ./apps/backend
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://autoheal:autoheal@postgres:5432/autoheal
+      AGENT_URL: http://agent:8002
+      MOCK_SERVICE_URL: http://mock-service:8000
+      PROMETHEUS_URL: http://prometheus:9090
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: autoheal
+      POSTGRES_USER: autoheal
+      POSTGRES_PASSWORD: autoheal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autoheal -d autoheal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mock-service:
+    build: ./apps/mock-service
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    
+    
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+    depends_on:
+      - mock-service
+      - alertmanager
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    restart: unless-stopped
+  
+  agent:
+    build: ./apps/agent
+    ports:
+      - "8002:8002"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY:?Set GROQ_API_KEY in .env}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      PROMETHEUS_URL: http://prometheus:9090
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+
+volumes:
+  postgres_data:

@@ -1,0 +1,12 @@
+
+route:
+  receiver: autoheal-webhook
+  group_wait: 1s
+  group_interval: 5s
+  repeat_interval: 1m
+
+receivers:
+  - name: autoheal-webhook
+    webhook_configs:
+      - url: http://backend:8001/incidents/webhook/alertmanager
+        send_resolved: true

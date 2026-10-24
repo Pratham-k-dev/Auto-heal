@@ -1,0 +1,21 @@
+
+groups:
+  - name: mock-production
+    interval: 5s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(mock_http_requests_total{path="/api/orders",status=~"5.."}[30s]))
+            /
+            clamp_min(
+              sum(rate(mock_http_requests_total{path="/api/orders"}[30s])),
+              0.001
+            )
+          ) > 0.3
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP 5xx error rate on mock service"
+          description: "The /api/orders endpoint is returning too many 5xx responses."
