@@ -68,6 +68,7 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY:?Set GROQ_API_KEY in .env}
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       PROMETHEUS_URL: http://prometheus:9090
+      MOCK_SERVICE_URL: http://mock-service:8000
     depends_on:
       - prometheus
     restart: unless-stopped

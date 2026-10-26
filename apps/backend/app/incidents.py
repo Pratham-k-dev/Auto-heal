@@ -1,17 +1,31 @@
 
+import asyncio
+import json
+import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
-from psycopg.types.json import Jsonb
+import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-import logging
+from psycopg.types.json import Jsonb
 
 from app.database import get_connection
-import os
-import httpx
-import asyncio
+
+logger = logging.getLogger(__name__)
+# Keeps startup-recovery tasks referenced until they finish.
+_automation_tasks = set()
+
 router = APIRouter(prefix="/incidents", tags=["incidents"])
+
+ACTION_ALERTS = {
+    "reset_injected_fault": {"HighErrorRate"},
+    "rollback_release": {"DeploymentRegression"},
+    "enable_payment_fallback": {
+        "PaymentDependencySlow",
+        "PaymentDependencyTimeouts",
+    },
+}
 
 
 def record_event(conn, incident_id: int, event_type: str, details: dict):
@@ -22,6 +36,183 @@ def record_event(conn, incident_id: int, event_type: str, details: dict):
         """,
         (incident_id, event_type, Jsonb(details)),
     )
+
+
+def _expected_alert_for_incident(action: str, labels: Any) -> str:
+    if isinstance(labels, str):
+        try:
+            labels = json.loads(labels)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Incident labels are invalid JSON") from exc
+
+    if not isinstance(labels, dict):
+        raise ValueError("Incident labels are not an object")
+
+    alert_name = labels.get("alertname")
+    if (
+        not isinstance(alert_name, str)
+        or alert_name not in ACTION_ALERTS.get(action, set())
+    ):
+        raise ValueError(
+            f"Alert {alert_name!r} is not valid for remediation {action!r}"
+        )
+
+    return alert_name
+
+
+def _service_state_is_valid(
+    action: str,
+    health: Any,
+    order_status_code: int,
+    order_data: Any,
+    pre_action_health: Any,
+) -> bool:
+    if not isinstance(health, dict) or health.get("status") != "ok":
+        return False
+    if order_status_code != 200 or not isinstance(order_data, dict):
+        return False
+
+    if action == "reset_injected_fault":
+        if not isinstance(pre_action_health, dict):
+            return False
+        return (
+            health.get("fault_mode") == "normal"
+            and "release" in pre_action_health
+            and health.get("release") == pre_action_health["release"]
+        )
+
+    if action == "rollback_release":
+        return (
+            health.get("fault_mode") == "normal"
+            and health.get("release") == "release-stable"
+        )
+
+    if action == "enable_payment_fallback":
+        if not isinstance(pre_action_health, dict):
+            return False
+        original_mode = pre_action_health.get("fault_mode")
+        return (
+            original_mode in {"dependency_slow", "dependency_timeout"}
+            and health.get("payment_fallback_enabled") is True
+            and health.get("fault_mode") == original_mode
+            and "release" in pre_action_health
+            and health.get("release") == pre_action_health["release"]
+            and order_data.get("payment_dependency") == "fallback"
+        )
+
+    return False
+
+
+def _action_result_is_valid(
+    action: str,
+    result: Any,
+    pre_action_health: dict,
+) -> bool:
+    if not isinstance(result, dict):
+        return False
+
+    if action == "reset_injected_fault":
+        return (
+            result.get("fault_mode") == "normal"
+            and "release" in pre_action_health
+            and result.get("release") == pre_action_health["release"]
+            and result.get("payment_fallback_enabled") is False
+        )
+
+    if action == "rollback_release":
+        return (
+            result.get("fault_mode") == "normal"
+            and result.get("release") == "release-stable"
+        )
+
+    if action == "enable_payment_fallback":
+        original_mode = pre_action_health.get("fault_mode")
+        return (
+            original_mode in {"dependency_slow", "dependency_timeout"}
+            and result.get("payment_fallback_enabled") is True
+            and result.get("fault_mode") == original_mode
+            and "release" in pre_action_health
+            and result.get("release") == pre_action_health["release"]
+        )
+
+    return False
+
+
+async def _query_alert_firing(
+    client: httpx.AsyncClient,
+    prometheus_url: str,
+    expected_alert: str,
+) -> bool:
+    response = await client.get(
+        f"{prometheus_url}/api/v1/query",
+        params={
+            "query": (
+                f'ALERTS{{alertname="{expected_alert}",'
+                'alertstate="firing"}'
+            )
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = data.get("result") if isinstance(data, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("status") != "success"
+        or not isinstance(rows, list)
+    ):
+        raise RuntimeError("Prometheus query returned an invalid response")
+    return bool(rows)
+
+
+def _persist_remediation_result(
+    incident_id: int,
+    remediation_id: int,
+    action: str,
+    status: str,
+    verification: dict,
+    error: str | None,
+    *,
+    reconciled: bool = False,
+) -> dict:
+    with get_connection() as conn:
+        updated = conn.execute(
+            """
+            UPDATE remediation_actions
+            SET status = %s,
+                completed_at = NOW(),
+                verification = %s,
+                error = %s
+            WHERE id = %s
+              AND incident_id = %s
+              AND status = 'executing'
+            RETURNING *
+            """,
+            (
+                status,
+                Jsonb(verification),
+                error,
+                remediation_id,
+                incident_id,
+            ),
+        ).fetchone()
+
+        if not updated:
+            raise HTTPException(
+                status_code=409,
+                detail="Remediation status changed during verification",
+            )
+
+        details = {
+            "remediation_id": remediation_id,
+            "action": action,
+            "verification": verification,
+            "error": error,
+        }
+        if reconciled:
+            details["reconciled"] = True
+        record_event(conn, incident_id, "remediation_" + status, details)
+        return updated
 
 
 
@@ -199,25 +390,25 @@ async def run_automatic_workflow(incident_id: int):
         remediation_id = None
 
         if (
-            proposed_action == "set_fault_normal"
+            proposed_action in {
+                "reset_injected_fault",
+                "rollback_release",
+                "enable_payment_fallback",
+            }
             and requires_approval is True
         ):
-            try:
-                remediation = request_remediation(incident_id)
-                remediation_id = remediation["id"]
+            remediation = request_remediation(incident_id)
+            remediation_id = remediation["id"]
 
-            except HTTPException as exc:
-                # An existing pending/executing action is not a failure:
-                # it already provides the approval boundary.
-                detail = exc.detail
-                if (
-                    exc.status_code == 409
-                    and isinstance(detail, dict)
-                    and "remediation_id" in detail
-                ):
-                    remediation_id = detail["remediation_id"]
-                else:
-                    raise
+            if remediation["rca_analysis_id"] != analysis["analysis_id"]:
+                raise RuntimeError(
+                    "Remediation is linked to a different RCA analysis"
+                )
+
+            if remediation["action"] != proposed_action:
+                raise RuntimeError(
+                    "Remediation action does not match the latest RCA"
+                )
 
         # "completed" means the investigation and decision finished.
         # It does NOT mean the remediation has been executed.
@@ -358,7 +549,7 @@ def get_incident(incident_id: int):
             """
             SELECT * FROM incident_events
             WHERE incident_id = %s
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC, id DESC
             """,
             (incident_id,),
         ).fetchall()
@@ -475,7 +666,12 @@ async def analyze_incident(incident_id: int):
             raise ValueError("Invalid supporting evidence")
         if not isinstance(evidence_gaps, list):
             raise ValueError("Invalid evidence gaps")
-        if proposed_action not in ("set_fault_normal", "no_action"):
+        if proposed_action not in {
+            "reset_injected_fault",
+            "rollback_release",
+            "enable_payment_fallback",
+            "no_action",
+        }:
             raise ValueError("Invalid proposed action")
         if not isinstance(action_reason, str):
             raise ValueError("Invalid action reason")
@@ -565,9 +761,17 @@ def get_incident_rca(incident_id: int):
         "incident_id": incident_id,
         "analyses": analyses,
     }
+
+
 @router.post("/{incident_id}/remediations")
 def request_remediation(incident_id: int):
-    """Create a pending request from the latest RCA."""
+    """Create an approval request linked to the latest eligible RCA."""
+    allowed_actions = {
+        "reset_injected_fault",
+        "rollback_release",
+        "enable_payment_fallback",
+    }
+
     with get_connection() as conn:
         analysis = conn.execute(
             """
@@ -586,7 +790,9 @@ def request_remediation(incident_id: int):
                 detail="Run RCA before requesting remediation",
             )
 
-        if analysis["proposed_action"] != "set_fault_normal":
+        action = analysis["proposed_action"]
+
+        if action not in allowed_actions:
             raise HTTPException(
                 status_code=409,
                 detail="Latest RCA did not propose an executable action",
@@ -595,41 +801,80 @@ def request_remediation(incident_id: int):
         if not analysis["requires_approval"]:
             raise HTTPException(
                 status_code=409,
-                detail="This demo only supports approval-required actions",
+                detail="Remediation requires explicit approval",
             )
 
-        # Prevent duplicate pending or executing requests for one incident.
         existing = conn.execute(
             """
-            SELECT id, status
+            SELECT id, status, action, rca_analysis_id
             FROM remediation_actions
             WHERE incident_id = %s
               AND status IN ('pending', 'executing')
             ORDER BY id DESC
-            LIMIT 1
             """,
             (incident_id,),
-        ).fetchone()
+        ).fetchall()
 
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "A remediation is already in progress",
-                    "remediation_id": existing["id"],
-                    "status": existing["status"],
-                },
+        for item in existing:
+            same_request = (
+                item["action"] == action
+                and item["rca_analysis_id"] == analysis["id"]
             )
+
+            if same_request and item["status"] == "pending":
+                return {
+                    **dict(item),
+                    "incident_id": incident_id,
+                }
+
+            if item["status"] == "executing":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "A remediation is already executing",
+                        "remediation_id": item["id"],
+                        "status": item["status"],
+                    },
+                )
+
+            if not same_request:
+                reason = (
+                    "Rejected: superseded by a newer RCA or a different "
+                    "proposed action. No remediation was executed."
+                )
+
+                conn.execute(
+                    """
+                    UPDATE remediation_actions
+                    SET status = 'rejected',
+                        error = %s,
+                        completed_at = NOW()
+                    WHERE id = %s
+                      AND status = 'pending'
+                    """,
+                    (reason, item["id"]),
+                )
+
+                record_event(
+                    conn,
+                    incident_id,
+                    "remediation_rejected",
+                    {
+                        "remediation_id": item["id"],
+                        "reason": reason,
+                        "superseded_by_analysis_id": analysis["id"],
+                    },
+                )
 
         row = conn.execute(
             """
             INSERT INTO remediation_actions (
                 incident_id, rca_analysis_id, action
             )
-            VALUES (%s, %s, 'set_fault_normal')
+            VALUES (%s, %s, %s)
             RETURNING *
             """,
-            (incident_id, analysis["id"]),
+            (incident_id, analysis["id"], action),
         ).fetchone()
 
         record_event(
@@ -639,11 +884,12 @@ def request_remediation(incident_id: int):
             {
                 "remediation_id": row["id"],
                 "analysis_id": analysis["id"],
-                "action": "set_fault_normal",
+                "action": action,
             },
         )
 
         return row
+
 
 
 
@@ -656,7 +902,6 @@ async def approve_remediation(
 ):
     """Approve, execute and verify an allowlisted remediation."""
 
-    # Atomically claim the pending action.
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -666,7 +911,11 @@ async def approve_remediation(
             WHERE id = %s
               AND incident_id = %s
               AND status = 'pending'
-              AND action = 'set_fault_normal'
+              AND action IN (
+                  'reset_injected_fault',
+                  'rollback_release',
+                  'enable_payment_fallback'
+              )
             RETURNING *
             """,
             (remediation_id, incident_id),
@@ -681,12 +930,22 @@ async def approve_remediation(
                 ),
             )
 
+        action = row["action"]
+
         record_event(
             conn,
             incident_id,
             "remediation_approved",
-            {"remediation_id": remediation_id},
+            {
+                "remediation_id": remediation_id,
+                "action": action,
+            },
         )
+
+    verification = {"action": action}
+    failure = None
+    expected_alert = None
+    pre_action_health = None
 
     service_url = os.getenv(
         "MOCK_SERVICE_URL",
@@ -698,149 +957,158 @@ async def approve_remediation(
         "http://prometheus:9090",
     ).rstrip("/")
 
-    verification = {}
-    failure = None
-
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            # Execute the one explicitly allowlisted action.
+        with get_connection() as conn:
+            incident = conn.execute(
+                "SELECT labels FROM incidents WHERE id = %s",
+                (incident_id,),
+            ).fetchone()
+        if not incident:
+            raise ValueError("Incident not found for remediation")
+        expected_alert = _expected_alert_for_incident(
+            action,
+            incident["labels"],
+        )
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            pre_action_response = await client.get(
+                f"{service_url}/health"
+            )
+            pre_action_response.raise_for_status()
+            pre_action_health = pre_action_response.json()
+            if (
+                not isinstance(pre_action_health, dict)
+                or pre_action_health.get("status") != "ok"
+            ):
+                raise RuntimeError(
+                    "Mock service health was invalid before remediation"
+                )
+
+            verification["expected_alert"] = expected_alert
+            verification["pre_action_health"] = pre_action_health
+            with get_connection() as conn:
+                saved = conn.execute(
+                    """
+                    UPDATE remediation_actions
+                    SET verification = %s
+                    WHERE id = %s
+                      AND incident_id = %s
+                      AND status = 'executing'
+                    RETURNING id
+                    """,
+                    (
+                        Jsonb(verification),
+                        remediation_id,
+                        incident_id,
+                    ),
+                ).fetchone()
+            if not saved:
+                raise RuntimeError(
+                    "Could not persist pre-remediation health snapshot"
+                )
+
             action_response = await client.post(
-                f"{service_url}/admin/fault",
-                json={"mode": "normal"},
+                f"{service_url}/admin/remediation",
+                json={"action": action},
             )
             action_response.raise_for_status()
             action_result = action_response.json()
-
-            if action_result.get("fault_mode") != "normal":
+            verification["service_state"] = action_result
+            if not _action_result_is_valid(
+                action,
+                action_result,
+                pre_action_health,
+            ):
                 raise RuntimeError(
-                    "Service did not confirm normal fault mode"
+                    f"Mock service did not confirm action {action}"
                 )
 
             recovery_checks = []
             alert_checks = []
-
-            # Ten checks, five seconds apart: about 45 seconds total.
+            verification["recovery_checks"] = recovery_checks
+            verification["alert_firing_checks"] = alert_checks
             for index in range(10):
                 health_response = await client.get(
                     f"{service_url}/health"
                 )
                 health_response.raise_for_status()
                 health = health_response.json()
-
                 order_response = await client.get(
                     f"{service_url}/api/orders"
                 )
+                try:
+                    order_data = order_response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Orders endpoint returned invalid JSON"
+                    ) from exc
 
-                service_ok = (
-                    health.get("status") == "ok"
-                    and health.get("fault_mode") == "normal"
-                    and order_response.status_code == 200
+                service_ok = _service_state_is_valid(
+                    action,
+                    health,
+                    order_response.status_code,
+                    order_data,
+                    pre_action_health,
                 )
-
                 recovery_checks.append({
                     "health": health,
                     "order_status_code": order_response.status_code,
+                    "orders": order_data,
                     "passed": service_ok,
                 })
-
-                # Query the live alert state, not historical 503 counters.
-                alert_response = await client.get(
-                    f"{prometheus_url}/api/v1/query",
-                    params={
-                        "query": (
-                            'ALERTS{alertname="HighErrorRate",'
-                            'alertstate="firing"}'
-                        )
-                    },
-                )
-                alert_response.raise_for_status()
-                alert_data = alert_response.json()
-
-                if alert_data.get("status") != "success":
-                    raise RuntimeError(
-                        "Prometheus query did not succeed"
+                alert_checks.append(
+                    await _query_alert_firing(
+                        client,
+                        prometheus_url,
+                        expected_alert,
                     )
-
-                firing = bool(
-                    alert_data.get("data", {}).get("result", [])
                 )
-                alert_checks.append(firing)
-
                 if index < 9:
                     await asyncio.sleep(5)
 
             service_stable = (
                 len(recovery_checks) == 10
-                and all(
-                    check["passed"]
-                    for check in recovery_checks
-                )
+                and all(check["passed"] for check in recovery_checks)
             )
-
             alert_cleared = (
                 len(alert_checks) == 10
-                and alert_checks[-1] is False
+                and all(firing is False for firing in alert_checks)
             )
-
             verified = service_stable and alert_cleared
-
-            verification = {
-                "fault_mode_set": action_result.get("fault_mode"),
-                "recovery_checks": recovery_checks,
-                "alert_firing_checks": alert_checks,
+            verification.update({
                 "service_stable": service_stable,
                 "alert_cleared": alert_cleared,
                 "verified": verified,
-            }
+            })
 
             if not verified:
                 failure = (
-                    "Recovery not confirmed: service checks failed "
-                    "or HighErrorRate remained firing"
+                    "Recovery verification failed: service checks or "
+                    "relevant alert-clear checks did not pass"
                 )
 
     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
         failure = (
-            f"Recovery verification failed: {type(exc).__name__}"
+            f"Remediation execution or verification failed: "
+            f"{type(exc).__name__}: {exc}"
         )
+        verification["verified"] = False
+        verification["error"] = failure
 
     final_status = "succeeded" if failure is None else "failed"
-
-    with get_connection() as conn:
-        conn.execute(
-            """
-            UPDATE remediation_actions
-            SET status = %s,
-                completed_at = NOW(),
-                verification = %s,
-                error = %s
-            WHERE id = %s
-              AND incident_id = %s
-              AND status = 'executing'
-            """,
-            (
-                final_status,
-                Jsonb(verification),
-                failure,
-                remediation_id,
-                incident_id,
-            ),
-        )
-
-        record_event(
-            conn,
-            incident_id,
-            "remediation_" + final_status,
-            {
-                "remediation_id": remediation_id,
-                "verification": verification,
-                "error": failure,
-            },
-        )
+    _persist_remediation_result(
+        incident_id,
+        remediation_id,
+        action,
+        final_status,
+        verification,
+        failure,
+    )
 
     return {
         "incident_id": incident_id,
         "remediation_id": remediation_id,
+        "action": action,
         "status": final_status,
         "verification": verification,
         "error": failure,
@@ -874,12 +1142,6 @@ def get_incident_remediations(incident_id: int):
         "incident_id": incident_id,
         "remediations": rows,
     }
-
-logger = logging.getLogger(__name__)
-
-# Keeps startup-recovery tasks referenced until they finish.
-_automation_tasks = set()
-
 
 def ensure_automation_table():
     """Create the persistent workflow-state table if it doesn't exist."""
@@ -1003,4 +1265,151 @@ def retry_automation(
     return {
         "incident_id": incident_id,
         "automation_status": "pending",
+    }
+
+
+
+async def reconcile_remediation(
+    incident_id: int,
+    remediation_id: int,
+):
+    """Reconcile a stuck execution using fresh recovery evidence."""
+
+    service_url = os.getenv(
+        "MOCK_SERVICE_URL",
+        "http://mock-service:8000",
+    ).rstrip("/")
+
+    prometheus_url = os.getenv(
+        "PROMETHEUS_URL",
+        "http://prometheus:9090",
+    ).rstrip("/")
+
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT remediation_actions.*, incidents.labels AS incident_labels
+            FROM remediation_actions
+            JOIN incidents
+              ON incidents.id = remediation_actions.incident_id
+            WHERE remediation_actions.id = %s
+              AND remediation_actions.incident_id = %s
+              AND remediation_actions.status = 'executing'
+              AND remediation_actions.action IN (
+                  'reset_injected_fault',
+                  'rollback_release',
+                  'enable_payment_fallback'
+              )
+            """,
+            (remediation_id, incident_id),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=409,
+                detail="No executing remediation found to reconcile",
+            )
+
+        action = row["action"]
+        previous_verification = row["verification"]
+
+    if isinstance(previous_verification, str):
+        try:
+            previous_verification = json.loads(previous_verification)
+        except json.JSONDecodeError:
+            previous_verification = None
+
+    verification = (
+        dict(previous_verification)
+        if isinstance(previous_verification, dict)
+        else {"action": action}
+    )
+    verification["reconciled"] = True
+    failure = None
+
+    try:
+        expected_alert = _expected_alert_for_incident(
+            action,
+            row["incident_labels"],
+        )
+        pre_action_health = verification.get("pre_action_health")
+        if (
+            action in {"reset_injected_fault", "enable_payment_fallback"}
+            and not isinstance(pre_action_health, dict)
+        ):
+            raise ValueError(
+                "Pre-remediation health snapshot is missing or invalid"
+            )
+        verification["expected_alert"] = expected_alert
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            health_response = await client.get(
+                f"{service_url}/health"
+            )
+            health_response.raise_for_status()
+            health = health_response.json()
+
+            orders_response = await client.get(
+                f"{service_url}/api/orders"
+            )
+            try:
+                orders = orders_response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Orders endpoint returned invalid JSON"
+                ) from exc
+
+            service_ok = _service_state_is_valid(
+                action,
+                health,
+                orders_response.status_code,
+                orders,
+                pre_action_health,
+            )
+            alert_firing = await _query_alert_firing(
+                client,
+                prometheus_url,
+                expected_alert,
+            )
+            alert_cleared = not alert_firing
+            verified = service_ok and alert_cleared
+
+            verification.update({
+                "health": health,
+                "order_status_code": orders_response.status_code,
+                "orders": orders,
+                "service_stable": service_ok,
+                "alert_firing": alert_firing,
+                "alert_cleared": alert_cleared,
+                "verified": verified,
+            })
+
+            if not verified:
+                failure = (
+                    "Reconciliation failed: current service recovery "
+                    "or relevant alert-clear checks did not pass"
+                )
+
+    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+        failure = (
+            f"Reconciliation verification failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        verification["verified"] = False
+        verification["error"] = failure
+
+    final_status = "succeeded" if failure is None else "failed"
+    updated = _persist_remediation_result(
+        incident_id,
+        remediation_id,
+        action,
+        final_status,
+        verification,
+        failure,
+        reconciled=True,
+    )
+
+    return {
+        "remediation": updated,
+        "verification": verification,
     }

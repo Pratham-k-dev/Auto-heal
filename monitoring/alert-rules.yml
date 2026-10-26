@@ -1,21 +1,123 @@
 
+# groups:
+#   - name: mock-production
+#     interval: 5s
+#     rules:
+#       - alert: HighErrorRate
+#         expr: |
+#           (
+#             sum(rate(mock_http_requests_total{path="/api/orders",status=~"5.."}[30s]))
+#             /
+#             clamp_min(
+#               sum(rate(mock_http_requests_total{path="/api/orders"}[30s])),
+#               0.001
+#             )
+#           ) > 0.3
+#         for: 5s
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "High HTTP 5xx error rate on mock service"
+#           description: "The /api/orders endpoint is returning too many 5xx responses."
+#       - alert: PaymentDependencySlow
+#         expr: |
+#           (
+#             rate(mock_payment_dependency_duration_seconds_sum[30s])
+#             /
+#             clamp_min(
+#               rate(mock_payment_dependency_duration_seconds_count[30s]),
+#               0.001
+#             )
+#           ) > 1
+#         for: 10s
+#         labels:
+#           severity: warning
+#         annotations:
+#           summary: "Payment dependency response time is elevated"
+#           description: "Average simulated payment dependency latency exceeds one second."
+
+#       - alert: PaymentDependencyTimeouts
+#         expr: |
+#           (
+#             sum(rate(mock_payment_dependency_requests_total{status="504"}[30s]))
+#             /
+#             clamp_min(sum(rate(mock_payment_dependency_requests_total[30s])), 0.001)
+#           ) > 0.2
+#         for: 30s
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "Payment dependency is timing out"
+#           description: "A significant proportion of simulated payment dependency requests are timing out."
+
+#       - alert: DeploymentRegression
+#         expr: |
+#           (
+#             sum(rate(mock_http_requests_total{
+#               path="/api/orders",
+#               status=~"5..",
+#               release="release-regression"
+#             }[30s]))
+#             /
+#             clamp_min(
+#               sum(rate(mock_http_requests_total{
+#                 path="/api/orders",
+#                 release="release-regression"
+#               }[30s])),
+#               0.001
+#             )
+#           ) > 0.3
+#         for: 30s
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "Elevated errors following simulated deployment"
+#           description: "The regression release is returning an elevated proportion of HTTP 5xx responses."
+
+
 groups:
   - name: mock-production
     interval: 5s
     rules:
-      - alert: HighErrorRate
+      - alert: PaymentDependencyTimeouts
         expr: |
           (
-            sum(rate(mock_http_requests_total{path="/api/orders",status=~"5.."}[30s]))
+            sum(rate(mock_payment_dependency_requests_total{status="504"}[30s]))
             /
             clamp_min(
-              sum(rate(mock_http_requests_total{path="/api/orders"}[30s])),
+              sum(rate(mock_payment_dependency_requests_total[30s])),
+              0.001
+            )
+          ) > 0.2
+        for: 10s
+        labels:
+          severity: critical
+          demo_scenario: payment_timeout
+        annotations:
+          summary: "Payment dependency is timing out"
+          description: "More than 20% of simulated payment dependency requests are returning 504 responses."
+
+      - alert: DeploymentRegression
+        expr: |
+          (
+            sum(rate(mock_http_requests_total{
+              path="/api/orders",
+              status=~"5..",
+              release="release-regression"
+            }[30s]))
+            /
+            clamp_min(
+              sum(rate(mock_http_requests_total{
+                path="/api/orders",
+                release="release-regression"
+              }[30s])),
               0.001
             )
           ) > 0.3
-        for: 5s
+        for: 30s
         labels:
           severity: critical
+          demo_scenario: deployment_regression
         annotations:
-          summary: "High HTTP 5xx error rate on mock service"
-          description: "The /api/orders endpoint is returning too many 5xx responses."
+          summary: "Elevated errors following simulated deployment"
+          description: "More than 30% of /api/orders requests for the regression release are returning HTTP 5xx responses."

@@ -1,0 +1,52 @@
+# ==========================================
+# DEMO 1: Payment Dependency Timeout
+# ==========================================
+
+# 1. Inject the fault
+Invoke-RestMethod -Method POST `
+  -Uri "http://localhost:8000/admin/fault" `
+  -ContentType "application/json" `
+  -Body '{"mode":"dependency_timeout"}'
+
+# 2. Generate traffic for the alert
+1..45 | ForEach-Object {
+    try {
+        Invoke-RestMethod "http://localhost:8000/api/orders" `
+          -TimeoutSec 10 | Out-Null
+    } catch {
+        # Expected errors are part of this fault scenario
+    }
+    Start-Sleep -Seconds 1
+}
+
+
+# ==========================================
+# DEMO 2: Deployment Regression
+# ==========================================
+
+# 1. Inject the fault
+Invoke-RestMethod -Method POST `
+  -Uri "http://localhost:8000/admin/fault" `
+  -ContentType "application/json" `
+  -Body '{"mode":"deployment_regression"}'
+
+# 2. Generate traffic for the alert
+1..60 | ForEach-Object {
+    try {
+        Invoke-RestMethod "http://localhost:8000/api/orders" `
+          -TimeoutSec 10 | Out-Null
+    } catch {
+        # Expected errors are part of this fault scenario
+    }
+    Start-Sleep -Seconds 1
+}
+
+
+# ==========================================
+# RESET: Return service to normal
+# ==========================================
+
+Invoke-RestMethod -Method POST `
+  -Uri "http://localhost:8000/admin/fault" `
+  -ContentType "application/json" `
+  -Body '{"mode":"normal"}'

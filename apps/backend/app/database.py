@@ -57,7 +57,13 @@ def init_db():
                 supporting_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
                 evidence_gaps JSONB NOT NULL DEFAULT '[]'::jsonb,
                 proposed_action TEXT NOT NULL
-                    CHECK (proposed_action IN ('set_fault_normal', 'no_action')),
+                    CHECK (proposed_action IN (
+                        'set_fault_normal',
+                        'reset_injected_fault',
+                        'rollback_release',
+                        'enable_payment_fallback',
+                        'no_action'
+                    )),
                 action_reason TEXT NOT NULL,
                 requires_approval BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -72,7 +78,12 @@ def init_db():
                 rca_analysis_id BIGINT NOT NULL
                     REFERENCES rca_analyses(id),
                 action TEXT NOT NULL
-                    CHECK (action IN ('set_fault_normal')),
+                    CHECK (action IN (
+                        'set_fault_normal',
+                        'reset_injected_fault',
+                        'rollback_release',
+                        'enable_payment_fallback'
+                    )),
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN (
                         'pending', 'executing', 'succeeded',
@@ -98,6 +109,9 @@ def init_db():
             CHECK (proposed_action IN (
                 'set_fault_normal',
                 'restart_service',
+                'reset_injected_fault',
+                'rollback_release',
+                'enable_payment_fallback',
                 'no_action'
             ))
         """)
@@ -112,7 +126,9 @@ def init_db():
             ADD CONSTRAINT remediation_actions_action_check
             CHECK (action IN (
                 'set_fault_normal',
-                'restart_service'
+                'restart_service',
+                'reset_injected_fault',
+                'rollback_release',
+                'enable_payment_fallback'
             ))
         """)
-

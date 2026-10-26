@@ -120,9 +120,19 @@ export default function IncidentWorkflow({
   }, [loadWorkflow])
 
   const latest = analyses[0]
-  const latestRemediation = remediations[0]
   const actionInProgress = remediations.some(
     (item) => item.status === 'pending' || item.status === 'executing',
+  )
+  const canRequestRemediation = Boolean(
+    latest &&
+      [
+        'reset_injected_fault',
+        'rollback_release',
+        'enable_payment_fallback',
+      ].includes(
+        latest.proposed_action,
+      ) &&
+      latest.requires_approval,
   )
 
   async function analyze() {
@@ -285,21 +295,26 @@ export default function IncidentWorkflow({
               </p>
             </div>
 
-            {latest.proposed_action === 'set_fault_normal' &&
-              latest.requires_approval && (
-                <button
-                  className="button primary"
-                  onClick={() => void requestAction()}
-                  disabled={
-                    requesting || actionInProgress ||
-                    analyzing || approvingId !== null
-                  }
-                >
-                  {requesting ? 'Requesting…' : actionInProgress
-                    ? 'Remediation already in progress'
-                    : 'Request remediation'}
-                </button>
-              )}
+            {canRequestRemediation && (
+              <button
+                className="button primary"
+                onClick={() => void requestAction()}
+                disabled={
+                  requesting || actionInProgress ||
+                  analyzing || approvingId !== null
+                }
+              >
+                {requesting ? 'Requesting…' : actionInProgress
+                  ? 'Remediation already in progress'
+                  : 'Request remediation'}
+              </button>
+            )}
+
+            {!canRequestRemediation && latest.requires_approval && (
+              <p className="workflow-muted">
+                The latest RCA does not propose an eligible remediation action for this incident.
+              </p>
+            )}
           </div>
         )}
       </WorkflowSection>

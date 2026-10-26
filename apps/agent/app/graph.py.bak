@@ -1,0 +1,468 @@
+
+import json
+import os
+from typing import TypedDict
+
+import httpx
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_groq import ChatGroq
+from langgraph.graph import END, START, StateGraph
+
+from app.schemas import IncidentInput, RCAResult
+
+
+PROMETHEUS_URL = os.getenv(
+    "PROMETHEUS_URL",
+    "http://localhost:9090",
+).rstrip("/")
+
+MOCK_SERVICE_URL = os.getenv(
+    "MOCK_SERVICE_URL",
+    "http://localhost:8000",
+).rstrip("/")
+
+MODEL_NAME = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-120b",
+)
+
+llm = ChatGroq(
+    model=MODEL_NAME,
+    temperature=0,
+)
+
+MAX_INVESTIGATION_ROUNDS = 6
+MAX_TOOL_RESULT_CHARS = 8000
+
+
+class AgentState(TypedDict, total=False):
+    incident: dict
+    evidence: dict
+    result: dict
+
+
+def get_json(url: str, params: dict | None = None) -> dict:
+    """Make a bounded-time read-only GET request to a configured service."""
+    try:
+        response = httpx.get(url, params=params, timeout=5.0)
+        response.raise_for_status()
+        payload = response.json()
+
+        if not isinstance(payload, dict):
+            return {"error": "Unexpected response format"}
+
+        return payload
+
+    except (httpx.HTTPError, ValueError) as exc:
+        return {"error": f"Request failed: {type(exc).__name__}"}
+
+
+@tool
+def query_prometheus(query: str) -> dict:
+    """Run a read-only PromQL instant query. Use this to investigate current
+    alert state, request error rates, latency, dependency failures, and
+    release-specific metrics. Do not infer that a missing series is zero."""
+    if not query.strip() or len(query) > 1000:
+        return {"error": "Query must contain 1-1000 characters"}
+
+    result = get_json(
+        f"{PROMETHEUS_URL}/api/v1/query",
+        params={"query": query},
+    )
+
+    if result.get("status") != "success":
+        if "error" in result:
+            return result
+        return {"error": "Prometheus query was unsuccessful"}
+
+    return {"data": result.get("data", {}).get("result", [])}
+
+
+@tool
+def get_service_health() -> dict:
+    """Read the mock production service health, current injected fault mode,
+    and current release. Use this to establish the service's present state."""
+    return get_json(f"{MOCK_SERVICE_URL}/health")
+
+
+@tool
+def get_recent_events(limit: int = 30) -> dict:
+    """Read recent diagnostic events, such as request failures, dependency
+    timeouts, and fault changes. Limit must be between 1 and 50."""
+    if not 1 <= limit <= 50:
+        return {"error": "limit must be between 1 and 50"}
+
+    result = get_json(
+        f"{MOCK_SERVICE_URL}/diagnostics/events",
+        params={"limit": limit},
+    )
+
+    events = result.get("events")
+    if isinstance(events, list):
+        result["events"] = events[-limit:]
+
+    return result
+
+
+@tool
+def get_recent_changes(limit: int = 20) -> dict:
+    """Read recent simulated deployments and fault-mode changes. Use this
+    to investigate whether a change preceded the incident. Limit is 1-50."""
+    if not 1 <= limit <= 50:
+        return {"error": "limit must be between 1 and 50"}
+
+    result = get_json(f"{MOCK_SERVICE_URL}/admin/changes")
+    changes = result.get("changes")
+
+    if isinstance(changes, list):
+        result["changes"] = changes[:limit]
+
+    return result
+
+
+INVESTIGATION_TOOLS = [
+    query_prometheus,
+    get_service_health,
+    get_recent_events,
+    get_recent_changes,
+]
+
+TOOLS_BY_NAME = {
+    item.name: item
+    for item in INVESTIGATION_TOOLS
+}
+
+
+def scalar_value(query_result: dict) -> float | None:
+    """Extract one numeric value from a successful Prometheus instant query."""
+    if "error" in query_result:
+        return None
+
+    rows = query_result.get("data", [])
+    if not rows:
+        return None
+
+    try:
+        value = float(rows[0]["value"][1])
+        if value != value or abs(value) == float("inf"):
+            return None
+        return value
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+
+def collect_evidence(state: AgentState):
+    """
+    Collect compact, deterministic evidence without an LLM tool-selection loop.
+    Remediation eligibility is determined by Python, never by the LLM.
+    """
+    import json
+
+    incident = state["incident"]
+
+    # Support the common incident payload shapes.
+    labels = incident.get("labels") or {}
+    alert_name = (
+        incident.get("alert_name")
+        or incident.get("alertname")
+        or labels.get("alertname")
+        or incident.get("name")
+        or "Unknown"
+    )
+
+    tool_results = []
+    query_errors = []
+
+    def call_tool(tool, arguments, label):
+        """Call an existing read-only tool and record a compact result."""
+        try:
+            result = tool.invoke(arguments)
+
+            # Bound the evidence sent to the final LLM call.
+            serialized = json.dumps(result, default=str)
+            if len(serialized) > 2500:
+                serialized = serialized[:2500] + "... [truncated]"
+
+            tool_results.append({
+                "tool": label,
+                "result": serialized,
+            })
+            return result
+        except Exception as exc:
+            error = f"{label}: {type(exc).__name__}: {str(exc)[:250]}"
+            query_errors.append(error)
+            tool_results.append({
+                "tool": label,
+                "error": error,
+            })
+            return {"error": error}
+
+    def run_query(name, query):
+        return call_tool(
+            query_prometheus,
+            {"query": query},
+            name,
+        )
+
+    def scalar_value_safe(result):
+        """Read the first Prometheus scalar/vector value without guessing."""
+        if not isinstance(result, dict) or result.get("error"):
+            return None
+
+        rows = result.get("data")
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        try:
+            value = rows[0]["value"][1]
+            number = float(value)
+            # Reject NaN and infinities.
+            if number != number or number in (float("inf"), float("-inf")):
+                return None
+            return number
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+
+    # Always gather basic service context, but keep each result small.
+    health = call_tool(get_service_health, {}, "service_health")
+    events = call_tool(
+        get_recent_events, {"limit": 8}, "recent_events"
+    )
+    changes = call_tool(
+        get_recent_changes, {"limit": 8}, "recent_changes"
+    )
+
+    # Check whether this specific alert is currently firing in Prometheus.
+    firing_result = run_query(
+        "alert_firing",
+        f'ALERTS{{alertname="{alert_name}",alertstate="firing"}}',
+    )
+    firing_rows = (
+        firing_result.get("data", [])
+        if isinstance(firing_result, dict)
+        else []
+    )
+    alert_is_firing = (
+        isinstance(firing_rows, list) and len(firing_rows) > 0
+    )
+
+    evidence = {
+        "investigation_mode": "deterministic",
+        "investigation_tools_called": len(tool_results),
+        "tool_results": tool_results,
+        "alert_name": alert_name,
+        "alert_is_firing": alert_is_firing,
+        "evidence_collection_errors": query_errors,
+    }
+
+    # Default: no remediation unless a specific deterministic gate passes.
+    eligible_action = "no_action"
+    gate = None
+
+    if alert_name == "HighErrorRate":
+        error_ratio_query = (
+            'sum(rate(mock_http_requests_total'
+            '{path="/api/orders",status=~"5.."}[30s])) '
+            '/ sum(rate(mock_http_requests_total'
+            '{path="/api/orders"}[30s]))'
+        )
+        request_rate_query = (
+            'sum(rate(mock_http_requests_total'
+            '{path="/api/orders"}[30s]))'
+        )
+
+        error_ratio_result = run_query(
+            "orders_error_ratio", error_ratio_query
+        )
+        request_rate_result = run_query(
+            "orders_request_rate", request_rate_query
+        )
+
+        error_ratio = scalar_value_safe(error_ratio_result)
+        request_rate = scalar_value_safe(request_rate_result)
+
+        health_ok = (
+            isinstance(health, dict)
+            and not health.get("error")
+            and health.get("status") == "ok"
+        )
+
+        gate = {
+            "alert_is_firing": alert_is_firing,
+            "error_ratio": error_ratio,
+            "request_rate": request_rate,
+            "health_ok": health_ok,
+            "queries_succeeded": (
+                error_ratio is not None
+                and request_rate is not None
+            ),
+        }
+
+        eligible = (
+            gate["queries_succeeded"]
+            and alert_is_firing
+            and error_ratio > 0.3
+            and request_rate > 0
+            and health_ok
+        )
+
+        if eligible:
+            eligible_action = "reset_injected_fault"
+
+    elif alert_name == "DeploymentRegression":
+        error_ratio_query = (
+            'sum(rate(mock_http_requests_total'
+            '{path="/api/orders",status=~"5..",'
+            'release="release-regression"}[30s])) '
+            '/ sum(rate(mock_http_requests_total'
+            '{path="/api/orders",release="release-regression"}[30s]))'
+        )
+        request_rate_query = (
+            'sum(rate(mock_http_requests_total'
+            '{path="/api/orders",release="release-regression"}[30s]))'
+        )
+
+        error_ratio_result = run_query(
+            "regression_error_ratio", error_ratio_query
+        )
+        request_rate_result = run_query(
+            "regression_request_rate", request_rate_query
+        )
+
+        error_ratio = scalar_value_safe(error_ratio_result)
+        request_rate = scalar_value_safe(request_rate_result)
+
+        health_ok = (
+            isinstance(health, dict)
+            and not health.get("error")
+            and health.get("status") == "ok"
+        )
+        current_release = (
+            health.get("release")
+            if isinstance(health, dict)
+            else None
+        )
+        release_matches = current_release == "release-regression"
+
+        gate = {
+            "alert_is_firing": alert_is_firing,
+            "error_ratio": error_ratio,
+            "request_rate": request_rate,
+            "health_ok": health_ok,
+            "current_release": current_release,
+            "release_matches": release_matches,
+            "queries_succeeded": (
+                error_ratio is not None
+                and request_rate is not None
+            ),
+        }
+
+        eligible = (
+            gate["queries_succeeded"]
+            and alert_is_firing
+            and error_ratio > 0.3
+            and request_rate > 0
+            and health_ok
+            and release_matches
+        )
+
+        if eligible:
+            eligible_action = "rollback_release"
+
+    elif alert_name == "PaymentDependencySlow":
+        run_query(
+            "payment_dependency_average_latency",
+            "sum(rate(mock_payment_dependency_duration_seconds_sum[30s])) "
+            "/ sum(rate(mock_payment_dependency_duration_seconds_count[30s]))",
+        )
+
+    elif alert_name == "PaymentDependencyTimeouts":
+        run_query(
+            "payment_dependency_timeout_ratio",
+            'sum(rate(mock_payment_dependency_requests_total'
+            '{status="504"}[30s])) '
+            '/ sum(rate(mock_payment_dependency_requests_total[30s]))',
+        )
+
+    evidence["remediation_gate"] = gate
+    evidence["remediation_eligible"] = eligible_action != "no_action"
+    evidence["eligible_action"] = eligible_action
+
+    if eligible_action == "no_action":
+        evidence["eligibility_reason"] = (
+            "No supported remediation gate passed. "
+            "The incident may still receive an RCA, but no action is eligible."
+        )
+    else:
+        evidence["eligibility_reason"] = (
+            f"Deterministic checks passed for {eligible_action}. "
+            "Human approval is still required before execution."
+        )
+
+    return {"evidence": evidence}
+
+
+def analyze_incident(state: AgentState) -> dict:
+    incident = state["incident"]
+    evidence = state["evidence"]
+
+    analysis_llm = llm.with_structured_output(RCAResult)
+
+    prompt = f"""
+Analyze this incident using only the supplied investigation evidence.
+
+INCIDENT:
+{json.dumps(incident, default=str)}
+
+INVESTIGATION EVIDENCE:
+{json.dumps(evidence, default=str)}
+
+Rules:
+- The only executable actions are reset_injected_fault and rollback_release.
+- Choose reset_injected_fault only when eligible_action is reset_injected_fault.
+- Choose rollback_release only when eligible_action is rollback_release.
+- Otherwise, recommend no_action.
+- Never choose an action different from eligible_action.
+- Never claim an action has already executed.
+- requires_approval must always be true.
+"""
+
+    parsed = analysis_llm.invoke(prompt)
+
+    if not isinstance(parsed, RCAResult):
+        parsed = RCAResult.model_validate(parsed)
+
+    if (
+        parsed.proposed_action
+        != evidence.get("eligible_action", "no_action")
+    ):
+        parsed.proposed_action = "no_action"
+        parsed.action_reason = (
+            "The proposed action did not match the deterministic "
+            "remediation eligibility decision."
+        )
+        parsed.evidence_gaps = list(parsed.evidence_gaps) + [
+            "The proposed action was blocked by the eligibility guard."
+        ]
+    parsed.incident_id = incident["incident_id"]
+    parsed.requires_approval = True
+
+    return {"result": parsed.model_dump()}
+
+
+builder = StateGraph(AgentState)
+builder.add_node("collect_evidence", collect_evidence)
+builder.add_node("analyze_incident", analyze_incident)
+
+builder.add_edge(START, "collect_evidence")
+builder.add_edge("collect_evidence", "analyze_incident")
+builder.add_edge("analyze_incident", END)
+
+graph = builder.compile()
+
+
+def run_analysis(incident: IncidentInput) -> RCAResult:
+    output = graph.invoke({"incident": incident.model_dump()})
+    return RCAResult.model_validate(output["result"])
